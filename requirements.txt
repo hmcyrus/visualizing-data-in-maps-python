@@ -1,0 +1,22 @@
+# Core data
+numpy>=1.24
+pandas>=2.0
+shapely>=2.0
+
+# Geospatial processing
+geopandas>=0.14
+pyproj>=3.5
+rasterio>=1.3
+
+# Interactive maps
+folium>=0.15
+plotly>=5.18
+pydeck>=0.9
+bokeh>=3.3
+
+# Static maps
+matplotlib>=3.7
+contextily>=1.4
+
+# Deployment
+streamlit>=1.28
