@@ -19,15 +19,15 @@ from bokeh.models import (
     HoverTool,
     ColorBar,
     LinearColorMapper,
-    MultiLine,
-    Segment,
-    TileSource,
+    GlyphRenderer,
+    Legend,
+    LegendItem,
 )
-from bokeh.transform import linear_cmap
-from bokeh.palettes import Viridis256, YlOrRd9, RdYlBu11
+from bokeh.palettes import RdYlBu11
 from pyproj import Transformer
 
-from data.synthetic import substations, power_flows, flood_intensity_points
+from data.synthetic import flood_intensity_points
+from data.pgcb import pgcb_substations, pgcb_lines, VOLTAGE_COLOUR, VOLTAGE_WIDTH, NODE_COLOUR
 
 OUTPUT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -46,77 +46,118 @@ def latlon_to_mercator(lats, lons):
 # ---------------------------------------------------------------------------
 
 def make_power_grid():
-    subs = substations()
-    flows = power_flows(25)
+    lines = pgcb_lines(voltages=(400, 230, 132))
+    subs  = pgcb_substations()
 
-    xs, ys = latlon_to_mercator(subs["lat"].values, subs["lon"].values)
-    subs_src = ColumnDataSource(dict(
-        x=xs, y=ys,
-        name=subs["name"],
-        capacity=subs["capacity_mw"],
-        size=np.sqrt(subs["capacity_mw"]) * 1.5,
-    ))
-
-    # arcs as segments
-    src_x, src_y = latlon_to_mercator(flows["src_lat"].values, flows["src_lon"].values)
-    dst_x, dst_y = latlon_to_mercator(flows["dst_lat"].values, flows["dst_lon"].values)
-    max_load = flows["load_mw"].max()
-    flow_src = ColumnDataSource(dict(
-        x0=src_x, y0=src_y,
-        x1=dst_x, y1=dst_y,
-        load=flows["load_mw"],
-        src_name=flows["src_name"],
-        dst_name=flows["dst_name"],
-        lw=(1 + 6 * flows["load_mw"] / max_load).values,
-    ))
-
+    cx, cy = latlon_to_mercator([23.8], [90.4])
     output_file(os.path.join(OUTPUT, "bokeh_power_grid.html"),
-                title="Power Grid Map")
+                title="PGCB Transmission Network")
 
     p = figure(
-        x_range=(-100_000 + latlon_to_mercator([23.8], [90.4])[0][0],
-                  100_000 + latlon_to_mercator([23.8], [90.4])[0][0]),
-        y_range=(-200_000 + latlon_to_mercator([23.8], [90.4])[1][0],
-                  200_000 + latlon_to_mercator([23.8], [90.4])[1][0]),
+        x_range=(cx[0] - 420_000, cx[0] + 340_000),
+        y_range=(cy[0] - 380_000, cy[0] + 370_000),
         x_axis_type="mercator",
         y_axis_type="mercator",
-        width=800,
-        height=700,
-        title="Power Grid — Substations & Flow",
-        tools="pan,wheel_zoom,reset,hover,tap",
+        width=860,
+        height=820,
+        title="PGCB Transmission Network — 400 / 230 / 132 kV",
+        tools="pan,wheel_zoom,reset",
         toolbar_location="right",
     )
     p.add_tile("CartoDB Dark Matter")
 
-    # flow lines
-    p.segment(
-        x0="x0", y0="y0", x1="x1", y1="y1",
-        source=flow_src,
-        line_color="rgba(255,153,0,0.55)",
-        line_width="lw",
-    )
+    # --- Transmission lines — one Segment renderer per voltage level ---
+    line_renderers = []
+    for v in (132, 230, 400):    # draw 132 first so 400 kV appears on top
+        vlines = lines[lines["voltage_kv"] == v]
+        if vlines.empty:
+            continue
+        sx, sy = latlon_to_mercator(vlines["src_lat"].values, vlines["src_lon"].values)
+        dx, dy = latlon_to_mercator(vlines["dst_lat"].values, vlines["dst_lon"].values)
+        src = ColumnDataSource(dict(
+            x0=sx, y0=sy, x1=dx, y1=dy,
+            line_name=vlines["name"].values,
+            src_node=vlines["src"].values,
+            dst_node=vlines["dst"].values,
+            length_km=vlines["length_km"].values,
+            voltage=[v] * len(vlines),
+        ))
+        r = p.segment(
+            x0="x0", y0="y0", x1="x1", y1="y1",
+            source=src,
+            line_color=VOLTAGE_COLOUR[v],
+            line_width=VOLTAGE_WIDTH[v] * 1.8,
+            line_alpha=0.85,
+        )
+        line_renderers.append((f"{v} kV", [r]))
 
-    # substation circles
-    cap_mapper = LinearColorMapper(palette=Viridis256,
-                                   low=subs["capacity_mw"].min(),
-                                   high=subs["capacity_mw"].max())
-    circles = p.scatter(
-        "x", "y",
-        source=subs_src,
-        size="size",
-        fill_color={"field": "capacity", "transform": cap_mapper},
-        line_color="white",
-        line_width=0.5,
-        alpha=0.9,
-    )
-    color_bar = ColorBar(color_mapper=cap_mapper, label_standoff=8,
-                         title="Capacity (MW)")
-    p.add_layout(color_bar, "right")
+    p.add_tools(HoverTool(
+        renderers=[item[1][0] for item in line_renderers],
+        tooltips=[
+            ("Line",    "@line_name"),
+            ("Route",   "@src_node → @dst_node"),
+            ("Voltage", "@voltage kV"),
+            ("Length",  "@length_km km"),
+        ],
+    ))
 
-    p.add_tools(HoverTool(renderers=[circles], tooltips=[
-        ("Substation", "@name"),
-        ("Capacity", "@capacity MW"),
-    ]))
+    # --- Nodes — scatter per node_type ---
+    _TYPE_LABEL = {
+        "substation":   "Substation",
+        "thermal_pp":   "Thermal PP",
+        "hydro_pp":     "Hydro PP",
+        "renewable_pp": "Renewable PP",
+        "hvdc_btp":     "HVDC BtB",
+    }
+    node_renderers = []
+    for ntype, label in _TYPE_LABEL.items():
+        subset = subs[subs["node_type"] == ntype]
+        if subset.empty:
+            continue
+        xs, ys = latlon_to_mercator(subset["lat"].values, subset["lon"].values)
+        sizes = (subset["capacity_mva"].apply(
+            lambda c: max(6, min(22, c ** 0.5 * 0.9)) if c > 0 else 7
+        ).values)
+        nsrc = ColumnDataSource(dict(
+            x=xs, y=ys,
+            name=subset["name"].values,
+            node_type=subset["node_type"].values,
+            capacity=subset["capacity_mva"].values,
+            zone=subset["zone"].values,
+            size=sizes,
+        ))
+        r = p.scatter(
+            "x", "y",
+            source=nsrc,
+            size="size",
+            fill_color=NODE_COLOUR[ntype],
+            line_color="white",
+            line_width=0.6,
+            fill_alpha=0.95,
+        )
+        node_renderers.append((label, [r]))
+
+    p.add_tools(HoverTool(
+        renderers=[item[1][0] for item in node_renderers],
+        tooltips=[
+            ("Name",     "@name"),
+            ("Type",     "@node_type"),
+            ("Zone",     "@zone"),
+            ("Capacity", "@capacity MVA"),
+        ],
+    ))
+
+    # --- Legend ---
+    legend = Legend(
+        items=[LegendItem(label=lbl, renderers=r) for lbl, r in line_renderers + node_renderers],
+        location="bottom_right",
+        background_fill_color="rgba(20,20,20,0.8)",
+        label_text_color="white",
+        border_line_color="#555",
+        title="PGCB Grid",
+        title_text_color="white",
+    )
+    p.add_layout(legend)
 
     path = os.path.join(OUTPUT, "bokeh_power_grid.html")
     save(p)

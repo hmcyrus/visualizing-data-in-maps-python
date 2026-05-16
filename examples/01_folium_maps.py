@@ -23,8 +23,8 @@ from data.synthetic import (
     flood_intensity_points,
     district_polygons,
     substations,
-    power_flows,
 )
+from data.pgcb import pgcb_substations, pgcb_lines, VOLTAGE_COLOUR, VOLTAGE_WIDTH, NODE_COLOUR
 
 OUTPUT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -100,39 +100,84 @@ def make_choropleth():
 # ---------------------------------------------------------------------------
 
 def make_power_flow():
-    flows = power_flows(25)
+    lines = pgcb_lines(voltages=(400, 230, 132))
+    subs  = pgcb_substations()
+
     m = folium.Map(location=CENTRE, zoom_start=7, tiles="CartoDB dark_matter")
 
-    max_load = flows["load_mw"].max()
+    # One FeatureGroup per voltage level — user can toggle each in the layer panel
+    volt_groups = {}
+    for v in (400, 230, 132):
+        fg = folium.FeatureGroup(name=f"{v} kV lines", show=True)
+        fg.add_to(m)
+        volt_groups[v] = fg
 
-    for _, row in flows.iterrows():
-        weight = 1 + 7 * row["load_mw"] / max_load
-        opacity = 0.4 + 0.5 * row["load_mw"] / max_load
+    for _, row in lines.iterrows():
+        v      = row["voltage_kv"]
+        colour = VOLTAGE_COLOUR[v]
+        weight = VOLTAGE_WIDTH[v] * 2.0
+        tip = (
+            f"<b>{row['src']} → {row['dst']}</b><br>"
+            f"{v} kV &nbsp;|&nbsp; {row['length_km']:.0f} km"
+        )
         folium.PolyLine(
             locations=[(row["src_lat"], row["src_lon"]),
                        (row["dst_lat"], row["dst_lon"])],
             weight=weight,
-            color="#ff9900",
-            opacity=opacity,
-            tooltip=(
-                f"{row['src_name']} → {row['dst_name']}<br>"
-                f"Load: {row['load_mw']} MW"
-            ),
-        ).add_to(m)
+            color=colour,
+            opacity=0.85,
+            tooltip=tip,
+        ).add_to(volt_groups[v])
 
-    # substation markers
-    subs = substations()
+    # Node FeatureGroups per type
+    _TYPE_LABEL = {
+        "substation":    "Substations",
+        "thermal_pp":    "Thermal PPs",
+        "hydro_pp":      "Hydro PPs",
+        "renewable_pp":  "Renewable PPs",
+        "hvdc_btp":      "HVDC BtB",
+    }
+    node_groups = {}
+    for ntype, label in _TYPE_LABEL.items():
+        fg = folium.FeatureGroup(name=label, show=True)
+        fg.add_to(m)
+        node_groups[ntype] = fg
+
     for _, sub in subs.iterrows():
+        ntype  = sub["node_type"]
+        colour = NODE_COLOUR.get(ntype, "#95a5a6")
+        radius = max(4, min(11, sub["capacity_mva"] / 180)) if sub["capacity_mva"] > 0 else 5
+        cap_str = f"{sub['capacity_mva']} MVA" if sub["capacity_mva"] > 0 else "—"
+        tip = (
+            f"<b>{sub['name']}</b><br>"
+            f"{_TYPE_LABEL.get(ntype, ntype)} | {sub['zone']}<br>"
+            f"Capacity: {cap_str}"
+        )
         folium.CircleMarker(
             location=[sub["lat"], sub["lon"]],
-            radius=5,
-            color="#00ccff",
+            radius=radius,
+            color=colour,
             fill=True,
-            fill_color="#00ccff",
-            fill_opacity=0.9,
-            tooltip=f"{sub['name']} — {sub['capacity_mw']} MW",
-        ).add_to(m)
+            fill_color=colour,
+            fill_opacity=0.92,
+            weight=1,
+            tooltip=tip,
+        ).add_to(node_groups.get(ntype, node_groups["substation"]))
 
+    # Voltage legend (bottom-left HTML overlay)
+    legend_html = """
+    <div style="position:fixed;bottom:30px;left:30px;z-index:9999;
+         background:rgba(20,20,20,0.82);padding:10px 14px;border-radius:7px;
+         color:#eee;font-family:sans-serif;font-size:12px;line-height:1.7;">
+      <b style="font-size:13px;">Voltage Level</b><br>
+      <span style="color:#e74c3c;font-size:18px;">&#9644;</span>&nbsp;400 kV<br>
+      <span style="color:#3498db;font-size:18px;">&#9644;</span>&nbsp;230 kV<br>
+      <span style="color:#f39c12;font-size:18px;">&#9644;</span>&nbsp;132 kV
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    folium.LayerControl(collapsed=False).add_to(m)
     path = os.path.join(OUTPUT, "folium_power_flow.html")
     m.save(path)
     print(f"  Saved: {path}")

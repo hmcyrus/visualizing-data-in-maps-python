@@ -20,13 +20,12 @@ import pandas as pd
 import json
 
 from data.synthetic import (
-    power_flows,
-    substations,
     flood_intensity_points,
     population_grid,
     district_polygons,
     river_network,
 )
+from data.pgcb import pgcb_substations, pgcb_lines, VOLTAGE_COLOUR, VOLTAGE_WIDTH, NODE_COLOUR
 
 OUTPUT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -38,41 +37,69 @@ VIEW = pdk.ViewState(latitude=23.8, longitude=90.4, zoom=6, pitch=40)
 # 1. ArcLayer — power flow between substations
 # ---------------------------------------------------------------------------
 
+def _hex_rgba(hex_colour: str, alpha: int = 200):
+    h = hex_colour.lstrip("#")
+    return [int(h[i:i+2], 16) for i in (0, 2, 4)] + [alpha]
+
+
 def make_arc_layer():
-    flows = power_flows(25)
-    max_load = flows["load_mw"].max()
+    lines = pgcb_lines(voltages=(400, 230, 132))
+    subs  = pgcb_substations()
 
-    # colour arcs by load: low=blue, high=red
-    flows["r"] = (255 * flows["load_mw"] / max_load).astype(int)
-    flows["g"] = 80
-    flows["b"] = (255 * (1 - flows["load_mw"] / max_load)).astype(int)
+    # Per-voltage RGBA columns (deck.gl reads per-row colour arrays)
+    _V_ALPHA = {400: 230, 230: 200, 132: 155}
+    lines["r"]   = lines["voltage_kv"].map(lambda v: _hex_rgba(VOLTAGE_COLOUR[v], _V_ALPHA[v])[0])
+    lines["g"]   = lines["voltage_kv"].map(lambda v: _hex_rgba(VOLTAGE_COLOUR[v], _V_ALPHA[v])[1])
+    lines["b"]   = lines["voltage_kv"].map(lambda v: _hex_rgba(VOLTAGE_COLOUR[v], _V_ALPHA[v])[2])
+    lines["a"]   = lines["voltage_kv"].map(lambda v: _V_ALPHA[v])
+    lines["arc_width"] = lines["voltage_kv"].map(VOLTAGE_WIDTH)
 
-    layer = pdk.Layer(
+    arc_layer = pdk.Layer(
         "ArcLayer",
-        data=flows,
+        data=lines,
         get_source_position=["src_lon", "src_lat"],
         get_target_position=["dst_lon", "dst_lat"],
-        get_source_color=[0, 180, 255, 180],
-        get_target_color=["r", "g", "b", 220],
-        get_width="load_mw / 120",
+        get_source_color=["r", "g", "b", "a"],
+        get_target_color=["r", "g", "b", "a"],
+        get_width="arc_width",
         pickable=True,
         auto_highlight=True,
     )
 
-    sub_layer = pdk.Layer(
+    # Node colours from hex → RGB columns
+    subs["nr"] = subs["node_type"].map(lambda t: _hex_rgba(NODE_COLOUR.get(t, "#95a5a6"))[0])
+    subs["ng"] = subs["node_type"].map(lambda t: _hex_rgba(NODE_COLOUR.get(t, "#95a5a6"))[1])
+    subs["nb"] = subs["node_type"].map(lambda t: _hex_rgba(NODE_COLOUR.get(t, "#95a5a6"))[2])
+    subs["radius"] = subs["capacity_mva"].apply(
+        lambda c: max(5_000, min(20_000, c * 9)) if c > 0 else 5_500
+    )
+
+    node_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=substations(),
+        data=subs,
         get_position=["lon", "lat"],
-        get_radius=8000,
-        get_fill_color=[0, 220, 255, 200],
+        get_radius="radius",
+        get_fill_color=["nr", "ng", "nb", 220],
+        stroked=True,
+        get_line_color=[255, 255, 255, 80],
+        line_width_min_pixels=1,
         pickable=True,
     )
 
     r = pdk.Deck(
-        layers=[layer, sub_layer],
+        layers=[arc_layer, node_layer],
         initial_view_state=VIEW,
         map_style="mapbox://styles/mapbox/dark-v9",
-        tooltip={"text": "{src_name} → {dst_name}\nLoad: {load_mw} MW"},
+        tooltip={
+            "html": (
+                "<b>{name}</b><br/>"
+                "{src} → {dst}<br/>"
+                "{voltage_kv} kV | {length_km} km<br/>"
+                "Type: {node_type} | Zone: {zone}<br/>"
+                "Capacity: {capacity_mva} MVA"
+            ),
+            "style": {"backgroundColor": "rgba(20,20,20,0.85)", "color": "white"},
+        },
     )
     path = os.path.join(OUTPUT, "pydeck_arc_layer.html")
     r.to_html(path)

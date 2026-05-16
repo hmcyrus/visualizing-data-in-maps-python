@@ -17,12 +17,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 
-from data.synthetic import (
-    district_polygons,
-    power_flows,
-    substations,
-    flood_time_series,
-)
+from data.synthetic import district_polygons, flood_time_series
+from data.pgcb import pgcb_substations, pgcb_lines, VOLTAGE_COLOUR, VOLTAGE_WIDTH, NODE_COLOUR
 
 OUTPUT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -65,47 +61,71 @@ def make_choropleth():
 # ---------------------------------------------------------------------------
 
 def make_scatter_map():
-    subs = substations()
-    flows = power_flows(25)
+    lines = pgcb_lines(voltages=(400, 230, 132))
+    subs  = pgcb_substations()
 
     fig = go.Figure()
 
-    # draw flow lines first so they appear beneath markers
-    max_load = flows["load_mw"].max()
-    for _, row in flows.iterrows():
-        width = 1 + 5 * row["load_mw"] / max_load
+    # Transmission lines — one trace per voltage level (None-separated segments)
+    for v in (132, 230, 400):   # draw lowest voltage first so 400 kV is on top
+        vlines = lines[lines["voltage_kv"] == v]
+        if vlines.empty:
+            continue
+        lats, lons = [], []
+        for _, row in vlines.iterrows():
+            lats += [row["src_lat"], row["dst_lat"], None]
+            lons += [row["src_lon"], row["dst_lon"], None]
         fig.add_trace(go.Scattermap(
-            lat=[row["src_lat"], row["dst_lat"], None],
-            lon=[row["src_lon"], row["dst_lon"], None],
+            lat=lats, lon=lons,
             mode="lines",
-            line={"width": width, "color": "rgba(255,153,0,0.6)"},
+            line={"width": VOLTAGE_WIDTH[v] * 1.6, "color": VOLTAGE_COLOUR[v]},
+            name=f"{v} kV",
+            opacity=0.85,
             hoverinfo="skip",
-            showlegend=False,
         ))
 
-    # substation markers sized by capacity
-    fig.add_trace(go.Scattermap(
-        lat=subs["lat"],
-        lon=subs["lon"],
-        mode="markers",
-        marker=dict(
-            size=subs["capacity_mw"] / 80,
-            color=subs["capacity_mw"],
-            colorscale="Viridis",
-            showscale=True,
-            colorbar={"title": "Capacity (MW)"},
-        ),
-        text=subs["name"],
-        hovertemplate="<b>%{text}</b><br>Capacity: %{marker.color} MW<extra></extra>",
-        name="Substations",
-    ))
+    # Nodes — one trace per node_type
+    _TYPE_LABEL = {
+        "substation":   "Substation",
+        "thermal_pp":   "Thermal PP",
+        "hydro_pp":     "Hydro PP",
+        "renewable_pp": "Renewable PP",
+        "hvdc_btp":     "HVDC BtB",
+    }
+    for ntype in ("substation", "thermal_pp", "hydro_pp", "renewable_pp", "hvdc_btp"):
+        subset = subs[subs["node_type"] == ntype]
+        if subset.empty:
+            continue
+        sizes = subset["capacity_mva"].apply(
+            lambda c: max(8, min(22, c / 90)) if c > 0 else 8
+        ).values
+        fig.add_trace(go.Scattermap(
+            lat=subset["lat"],
+            lon=subset["lon"],
+            mode="markers",
+            marker=dict(size=sizes, color=NODE_COLOUR[ntype], opacity=0.95),
+            name=_TYPE_LABEL[ntype],
+            text=subset["name"],
+            customdata=list(zip(subset["capacity_mva"], subset["zone"])),
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Type: " + _TYPE_LABEL[ntype] + "<br>"
+                "Capacity: %{customdata[0]} MVA<br>"
+                "Zone: %{customdata[1]}<extra></extra>"
+            ),
+        ))
 
     fig.update_layout(
-        title="Power Grid — Substations & Flow",
+        title="PGCB Transmission Network — 400 / 230 / 132 kV",
         map=dict(
             style="carto-darkmatter",
             center={"lat": CENTRE_LAT, "lon": CENTRE_LON},
             zoom=6,
+        ),
+        legend=dict(
+            bgcolor="rgba(30,30,30,0.75)",
+            font=dict(color="white"),
+            title=dict(text="Legend", font=dict(color="white")),
         ),
         margin={"r": 0, "t": 40, "l": 0, "b": 0},
     )

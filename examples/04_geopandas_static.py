@@ -1,10 +1,11 @@
 """
 GeoPandas + Matplotlib + contextily — static publication-quality maps.
 
-Outputs three PNG files to output/:
+Outputs four PNG files to output/:
   geopandas_district_density.png — choropleth with OpenStreetMap basemap
   geopandas_river_network.png    — river widths scaled by flow rate
   geopandas_combined.png         — overlay: districts + rivers + substations
+  geopandas_power_grid.png       — PGCB 400/230/132 kV transmission network
 
 Run:
     python examples/04_geopandas_static.py
@@ -29,6 +30,7 @@ from data.synthetic import (
     substations,
     flood_intensity_points,
 )
+from data.pgcb import pgcb_substations, pgcb_lines, VOLTAGE_COLOUR, VOLTAGE_WIDTH, NODE_COLOUR
 
 OUTPUT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 os.makedirs(OUTPUT, exist_ok=True)
@@ -195,10 +197,117 @@ def make_combined():
 
 
 # ---------------------------------------------------------------------------
+# 4. PGCB transmission network
+# ---------------------------------------------------------------------------
+
+def make_power_grid():
+    import matplotlib.patches as mpatches
+    from shapely.geometry import LineString
+
+    lines = pgcb_lines(voltages=(400, 230, 132))
+    subs  = pgcb_substations()
+
+    # Build line GeoDataFrame
+    line_geoms = [
+        LineString([(r.src_lon, r.src_lat), (r.dst_lon, r.dst_lat)])
+        for _, r in lines.iterrows()
+    ]
+    lines_gdf = gpd.GeoDataFrame(lines, geometry=line_geoms, crs="EPSG:4326").to_crs(WEB_MERCATOR)
+
+    # Build node GeoDataFrame
+    subs_gdf = gpd.GeoDataFrame(
+        subs,
+        geometry=[Point(r.lon, r.lat) for _, r in subs.iterrows()],
+        crs="EPSG:4326",
+    ).to_crs(WEB_MERCATOR)
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 14))
+
+    # Lines — 132 kV drawn first so 400 kV sits on top
+    for v, zorder in ((132, 1), (230, 2), (400, 3)):
+        subset = lines_gdf[lines_gdf["voltage_kv"] == v]
+        if subset.empty:
+            continue
+        subset.plot(
+            ax=ax,
+            color=VOLTAGE_COLOUR[v],
+            linewidth=VOLTAGE_WIDTH[v],
+            alpha=0.88,
+            zorder=zorder,
+        )
+
+    # Nodes — substations first, special nodes on top
+    _MARKER  = {"substation": "o", "thermal_pp": "^", "hydro_pp": "D",
+                 "renewable_pp": "s", "hvdc_btp": "*"}
+    _MSIZE   = {"substation": 22,  "thermal_pp": 70,  "hydro_pp": 65,
+                 "renewable_pp": 55, "hvdc_btp": 130}
+    _ZORDER  = {"substation": 10,  "thermal_pp": 11,  "hydro_pp": 12,
+                 "renewable_pp": 12, "hvdc_btp": 13}
+
+    for ntype in ("substation", "thermal_pp", "hydro_pp", "renewable_pp", "hvdc_btp"):
+        subset = subs_gdf[subs_gdf["node_type"] == ntype]
+        if subset.empty:
+            continue
+        subset.plot(
+            ax=ax,
+            color=NODE_COLOUR[ntype],
+            markersize=_MSIZE[ntype],
+            marker=_MARKER[ntype],
+            edgecolors="white",
+            linewidths=0.5,
+            alpha=0.95,
+            zorder=_ZORDER[ntype],
+        )
+
+    _add_basemap(ax, source=ctx.providers.CartoDB.DarkMatter)
+
+    # Legend
+    line_handles = [
+        mpatches.Patch(color=VOLTAGE_COLOUR[400], label="400 kV"),
+        mpatches.Patch(color=VOLTAGE_COLOUR[230], label="230 kV"),
+        mpatches.Patch(color=VOLTAGE_COLOUR[132], label="132 kV"),
+    ]
+    node_handles = [
+        plt.Line2D([0], [0], marker="o", color="none",
+                   markerfacecolor=NODE_COLOUR["substation"],   markersize=7,  label="Substation"),
+        plt.Line2D([0], [0], marker="^", color="none",
+                   markerfacecolor=NODE_COLOUR["thermal_pp"],   markersize=9,  label="Thermal PP"),
+        plt.Line2D([0], [0], marker="D", color="none",
+                   markerfacecolor=NODE_COLOUR["hydro_pp"],     markersize=8,  label="Hydro PP"),
+        plt.Line2D([0], [0], marker="*", color="none",
+                   markerfacecolor=NODE_COLOUR["hvdc_btp"],     markersize=12, label="HVDC BtB"),
+    ]
+    leg = ax.legend(
+        handles=line_handles + node_handles,
+        loc="lower right",
+        framealpha=0.85,
+        facecolor="#1a1a2e",
+        labelcolor="white",
+        edgecolor="#444",
+        fontsize=9,
+        title="PGCB Grid",
+        title_fontsize=10,
+    )
+    leg.get_title().set_color("white")
+
+    ax.set_axis_off()
+    ax.set_title(
+        "PGCB Transmission Network — 400 / 230 / 132 kV",
+        fontsize=14, pad=12,
+    )
+
+    path = os.path.join(OUTPUT, "geopandas_power_grid.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("Building GeoPandas / matplotlib maps...")
     make_district_density()
     make_river_network()
     make_combined()
+    make_power_grid()
     print("Done. PNG files saved in output/.")
